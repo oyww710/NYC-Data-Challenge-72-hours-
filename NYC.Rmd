@@ -1,0 +1,1102 @@
+---
+title: "NYC Green Taxi Data Challenge"
+author: Weiwei Ouyang
+date: "June 11, 2018"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r echo=FALSE}
+setwd("~/Downloads/ZillowNeighborhoods-NY")
+knitr::include_graphics("NYCFigure.PNG")
+```
+
+In this report, we will be investigating the New York City Taxi and Limousine commission about "Green" Taxis. Green Taxis (as opposed to yellow ones) are taxis that are not allowed to pick up passengers inside of the densely populated areas of Manhattan.We are using NYC Taxi and Limousine trip record data from September 2015:
+<http://www.nyc.gov/html/tlc/html/about/trip_record_data.shtml>.
+
+The data challenge is splitted into 5 questions. Our analysis report will fillow the questions step by step to conduct business understanding, data undertsanding, data preparation, modeling and evalution processes. All exploration,analysis and modeling of the dataset will be performed in R studio. The visualization packages will be **ggplot2** and **plotly**. 
+
+Before starting up, firstly we will clear up the workspace and load all packages needed.
+#### **Load the packages**
+```{r message=FALSE}
+#Clear the space
+rm(list=ls())
+#Load required packages
+library('data.table') #data manipulation
+library('dplyr') #pipeline operator
+library('ggplot2') #visualization
+library('curl') #R interface to libcurl
+library('lubridate') #deal with time-related varaible
+library('scales') #Graphical scales map
+library('caret') #machine learning package
+library('stringr') #deal with text variable
+library('corrplot') #heatmap of correlation matrix
+library('glmnet') #Lasso model
+library('randomForest') #Random forest
+library('maps') #map function
+library('xgboost') #Xgboosting 
+library('zoo') #time related variable
+library('VIM') #Missing value
+library('rgdal') #Map location inforamtion
+library('gridExtra') # grid layouts
+library('pastecs') # details summary stats
+library('gmodels') # build contingency tables
+library('ggfortify') #PCA
+library('plotly') #visualization
+
+```
+
+>Question 1:
+
+* Programmatically download and load into your favorite analytical tool the trip data for September 2015.
+* Report how many rows and columns of data you have loaded.
+
+#### **Description of data**
+
+**Load dataset**
+```{r message=FALSE}
+setwd("~/Downloads/ZillowNeighborhoods-NY")
+temp <- tempfile()
+download.file("https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2015-09.csv", temp)
+rawdata <- read.csv(temp,na.strings = '',stringsAsFactors = F)
+rm(temp)
+
+```
+
+**Glimpse the dataset**
+```{r}
+head(rawdata)
+```
+
+The detailed description of column variables can be found in the link below:
+<http://www.nyc.gov/html/tlc/downloads/pdf/data_dictionary_trip_records_green.pdf>
+
+**Check structure and dimension of the dataset**
+```{r cars}
+#Data structure
+str(rawdata)
+
+#check whether there are duplicated records
+which(duplicated(rawdata))
+
+#The size of dataset
+dim(rawdata)
+```
+
+There are no duplicate records for green taxi dataset from september,2015. There are 1494926 rows and 21 columns in this dataset. 
+
+>Question 2:
+
+* Plot a histogram of the number of the trip distance ("Trip Distance").
+* Report any structure you find and any hypotheses you have about that structure.
+
+**Data Checking**
+```{r}
+#Check the missing values
+length(which(is.na(rawdata$Trip_distance))) 
+
+#Check negative value
+length(which(rawdata$Trip_distance<0)) 
+
+#Summary of the variable
+summary(rawdata$Trip_distance) 
+```
+The trip distance has no missing and negative values.It ranges from 0 to 603.1 miles.However, the mean and median values are all small than 3. It indicates that outliers exist in the raw dataset.
+
+**histogram of the number of the trip distance**
+
+Let's have a look at the distribution of trip distance in raw dataset (Left figure).
+```{r}
+#histogram for raw dataset
+p1<-ggplot(rawdata, aes(x=Trip_distance)) + 
+  geom_histogram(color="black", fill="red",bins=100,alpha=0.5)
+
+#calculate % of trip distances within 20 miles
+dim(rawdata[rawdata$Trip_distance<20,])[1]/dim(rawdata)[1]
+
+#generate subset
+sub_data<-rawdata%>%filter(Trip_distance<20)
+
+#histogram for trip distance<20
+p2<-ggplot(sub_data, aes(x=Trip_distance)) + 
+  geom_histogram(color="black", fill="red",bins=25,alpha=0.5)
+
+grid.arrange(p1,p2, ncol=2)
+
+```
+
+Seen from the histogram on the left, 99.77% of the trip distances are within 20 miles. The trip distances larger than 20 miles are considered outliers. We plot the histogram of trip distances after removing outliers.After removing outliers, the distribution of trip Distance is still seriously skewed to the right(Right Figure).The majority of trips are short distances(<5 miles).
+
+**The hypothesis:** The trip distances are asymetric distributed and seems to have a lognormal distribution structure. 
+
+To confirm our hypothesis, we logarithmize the trip distance and then fit a normal distribution to its density after removing outliers.As shown below,after the log-transformation, the distribution of Log(Trip Distance) is approximately like symmetric distribution. It is noted that there are 20592 zero values here and are removed when plotting due to infinity value after log-transformation. 
+
+```{r}
+sub_data<-rawdata%>%filter(Trip_distance<20)%>%mutate(Log_TripDistance=log(Trip_distance))
+
+p3<-ggplot(sub_data, aes(x=Log_TripDistance)) + 
+ geom_histogram(aes(y=..density..), colour="black", fill="red")+geom_density(alpha=.2, fill="blue")
+
+p3
+
+```
+
+The QQ plot is also displayed below. The serious violation of normal distribution is mostly induced by the zero values. For the majority of observations, we can assume that they approximately follow normal distribution. This also confirms our hypothesis.
+
+```{r}
+ggplot(sub_data, aes(sample=Log_TripDistance))+stat_qq()
+
+```
+
+>Question 3:
+
+* Report mean and median trip distance grouped by hour of day.
+* We'd like to get a rough sense of identifying trips that originate or terminate at one of the NYC area airports. Can you provide a count of how many transactions fit this criteria, the average fare, and any other interesting characteristics of these trips
+
+#### **Mean&Median trip distance by hour of day**
+
+```{r}
+#Extract hour information and generate a new varaible 'Hour_day'.
+time<-strftime(rawdata$lpep_pickup_datetime, format="%H:%M:%S")
+rawdata<-rawdata%>%mutate(Hour_day=as.numeric(substr(time,1,2)))
+
+#Calculate mean and meadian trip distance group by hour of day
+mean_median = rawdata%>%group_by(Hour_day) %>% summarise(mean_distance = round(mean(Trip_distance),2), 
+                                                  median_distance = round(median(Trip_distance),2))
+print(mean_median)
+
+ggplot(mean_median, aes(Hour_day)) + ggtitle("Mean and Median of Trip Distance by Hour of Day")+
+  geom_line(aes(y = mean_distance, colour = "Mean of trip distance")) + 
+  geom_line(aes(y = median_distance, colour = "Median of trip distance"))+ylab("Trip Distance")+xlab('Hour of Day')
+
+```
+
+Seen from the figure above, the mean and median of trip distances show the similiar trends.The maximum peaks happened in the morning during 5:00AM to 6:00AM.The morning peak may be due to that people take taxi to avoid being late for work or rushing to airports. The minmum mean and median appeared during 6:00PM to 7:00PM at evening. The possible reason is that people will take public transportation instead of taxi in the evening.
+
+#### **Calcualte transactions to/from NYC airports**
+
+Next we identify trips that originate or terminate at one of the NYC area airports.The variable RateCodeID contains values indicating the final rate that was applied (JFK=2,Newark=3).Newark and JFK which are the two main airports in NYC.
+
+```{r}
+#Calculate transactions,average fare and total amount for airports
+transaction = rawdata%>% filter(RateCodeID == 2|RateCodeID == 3) %>% 
+  summarise(n = n(),ave_fare=mean(Fare_amount,na.rm=T),ave_total=mean(Total_amount,na.rm=T))
+
+print(transaction)
+```
+
+* Number of transactions to/from NYC airports are 5552. 
+* The average fare (calculated by the meter) for these transactions is $48.98 per trip. 
+* The average total amount (without tips) for these transactions is $57.21 per trip.
+
+#### **Compare transactions for JFK and Newark respectively**
+
+**A.Compare fare amount and total amount between JFK and Newark**
+
+There are two local airports in New York Region in this dataset: JFK and Newark. For variable RateCode ID, 2=JFK and 3=Newark. We want to further have a look at whether there are any difference in trips to/from NYC airports between the two airports in fare amount, total amount.Before comparison, we need to remove outliers with total amount or fare amount smaller than $0. We removed 2417 transactions. 
+
+```{r}
+#Generate dataset after removing outliers
+dta<-rawdata%>% filter(Fare_amount>=0,Total_amount>=0)
+
+#Calculate transactions,average fare and total amount for JFK
+transaction_JFK = dta%>% filter(RateCodeID == 2) %>% 
+  summarise(n = n(),ave_fare=mean(Fare_amount,na.rm=T),ave_total=mean(Total_amount,na.rm=T))
+
+print(transaction_JFK)
+
+#Calculate transactions,average fare and total amount for Newark
+transaction_Newark = dta%>% filter(RateCodeID == 3) %>% 
+  summarise(n = n(),ave_fare=mean(Fare_amount,na.rm=T),ave_total=mean(Total_amount,na.rm=T))
+
+print(transaction_Newark)
+
+#Generate subset for JFK and Newark respectively
+Dat_JFK<-dta%>%filter(RateCodeID==2)
+Dat_Newark<-dta%>%filter(RateCodeID==3)
+
+#Welch t test for JFK and Newark in fare and total amount
+t.test(Dat_JFK$Fare_amount,Dat_Newark$Fare_amount)  
+t.test(Dat_JFK$Total_amount,Dat_Newark$Total_amount)  
+
+```
+
+* JFK
+There are 4317 transactions.
+The average fare is $51.78 per trip.
+The average total amount is $59.52 per trip. 
+
+* Newark
+There are 1093 transactions.
+The average fare is $50.33 per trip
+The average total amount is $61.68 per trip. 
+
+Seen from welch t tests, there are no significant difference between JFK and Newark in fare amount and total amount on average (p value>0.05).  
+
+**B.Compare trip distance distribution between JFK and Newark**
+Then we further look at whether the trip distance distribution of JFK and Newark are different.
+
+```{r}
+#plot distribution of trip distance between JFK and Newark
+Airport<-c(rep("JFK",length(which(dta$RateCodeID==2))),rep("Newark",length(which(dta$RateCodeID==3))))
+Airport_TripDis<-data.frame(c(Dat_JFK$Trip_distance,Dat_Newark$Trip_distance),Airport)
+names(Airport_TripDis)<-c("Trip_Distance","Airport")
+
+ggplot(Airport_TripDis,aes(x=Trip_Distance,fill=Airport))+
+  geom_histogram(aes(y=..density..),position='identity',alpha=0.5,binwidth=1)
+
+```
+
+Both of JFK and Newark trips follow the same trend as the majority of the trips are short trips (trip distance <5miles).In addition, there is an peak of long range JFK trips (>15 miles) which might correspond to a great number people coming to JFK airports from further areas.
+
+**C.Compare hourly distribution of trips between JFK and Newark**
+We are also interested the hourly ditribution of trips between JFK and Newark.
+
+```{r}
+Airport_all<-data.frame(rbind(Dat_JFK,Dat_Newark),Airport)
+
+#Generate freq table group by airport and hour of day.
+Airport_all_hour = Airport_all %>%
+  group_by(Airport,Hour_day) %>%
+  summarise (n = n()) %>%
+  mutate(freq = n / sum(n))
+
+#Plot percentage barchart for JFK and Newark
+ggplot(data=Airport_all_hour, aes(x = Hour_day, y=freq*100, fill=Airport)) + 
+  geom_bar(stat="identity",position="dodge") +  ylab("Percentage of Trips") +xlab("Hour of Day")
+
+```
+The hourly distribution shows that the number of trips at both airports peaks around 3PM. On the other hand, the number of trips to/from airports are in shortage at 2AM.
+
+#### **Compare transactions for airport trips and non-airport trips respectively**
+
+Similarly, we have a look at the differences between airport trips and non-airport trips.
+
+**A.Compare fare amount and total amount between airport trips and non-airport trips**
+```{r}
+#Genearte subset for airport trips and non-airport trips
+airtrips<-dta%>% filter(RateCodeID == 2|RateCodeID == 3)%>%mutate(Trip='Airport')
+non_airtrips<-dta%>% filter(RateCodeID != 2,RateCodeID != 3)%>%mutate(Trip='Non-Airport')
+trip<-rbind(airtrips,non_airtrips)
+
+#Calculate transactions,average fare and total amount for airport trips
+transaction_air = airtrips%>% 
+  summarise(n = n(),ave_fare=mean(Fare_amount,na.rm=T),ave_total=mean(Total_amount,na.rm=T))
+
+print(transaction_air)
+
+#Calculate transactions,average fare and total amount for non airport trips
+transaction_noair= non_airtrips %>% 
+  summarise(n = n(),ave_fare=mean(Fare_amount,na.rm=T),ave_total=mean(Total_amount,na.rm=T))
+
+print(transaction_noair)
+
+#Welch t test for JFK and Newark in fare and total amount
+t.test(airtrips$Fare_amount,non_airtrips$Fare_amount)  
+t.test(airtrips$Total_amount,non_airtrips$Total_amount)  
+```
+
+* airport trips
+There are 5410 transactions.
+The average fare is $51.49 per trip.
+The average total amount is $59.96 per trip. 
+
+* Non airport trips
+There are 1487099 transactions.
+The average fare is $12.44 per trip
+The average total amount is $14.91 per trip. 
+
+Seen from welch t tests,the fare amount and total amount of airport trips are significantly higher than those of non-airport trips on average (p value<0.05). Seen from the results,non airport trips are usually short trips whereas airport trips are long trips since the distance between any of the two airports and Manhattan is over 10 miles. In next section, we further explore the trip distance distribution between airport trips and non-airport trips.
+
+**B.Compare trip distance distribution between airport trips and non-airport trips**
+
+As discussed in Question 2, the trip distances larger than 20 miles are considered outliers.
+```{r}
+#Remove outliers
+trip<-trip[trip$Trip_distance<=20,]
+
+#Plot density figure for airport trips and non-airport trips
+ggplot(trip,aes(x=Trip_distance,fill=Trip))+
+  geom_histogram(aes(y=..density..),position='identity',alpha=0.5,binwidth=1)
+
+```
+
+There are two peaks here.The majority of the trips are short trips (trip distance < 2miles).However, There is an peak of long range airport trips (>15 miles) that are due to people rushing to/from airport to downtown.
+
+**C.Compare hourly distribution of trips between airport trips and non-airport trips**
+
+```{r}
+#Generate freq table group by trip type and hour of day.
+trip_hour = trip %>%
+  group_by(Trip,Hour_day) %>%
+  summarise (n = n()) %>%
+  mutate(freq = n / sum(n))
+
+#Plot percentage barchart for JFK and Newark
+ggplot(data=trip_hour, aes(x = Hour_day, y=freq*100, fill=Trip)) + 
+  geom_bar(stat="identity",position="dodge") +  ylab("Percentage of Trips") +xlab("Hour of Day")
+
+```
+The hourly distribution shows that the number of airport trips peaks around 3PM. On the other hand, the number of non-airport trips peaks at about 5PM.
+
+>Question 4:
+
+* Build a derived variable for tip as a percentage of the total fare.
+* Build a predictive model for tip as a percentage of the total fare. Use as much of the data as you like (or all of it). Provide an estimate of performance using an appropriate sample, and show your work.
+
+#### **Derive variable for tip as a percentage of the total fare**
+
+Since the initial charge for green taxi is $2.5 in NYC(<http://www.nyc.gov/html/tlc/html/passenger/taxicab_rate.shtml>), any transaction smaller than 2.5 will be removed.
+
+**Generate derived variable**
+```{r}
+#Clear workspace
+rm(Airport,Airport_all,Airport_all_hour,Airport_fare,Airport_total,Airport_trip,Airport_TripDis,
+airtrips,Dat_JFK,Dat_Newark,dta,non_airtrips,p1,p2,p3,time,transaction_air,transaction_JFK,transaction_Newark,transaction_noair,trip,trip_hour)
+
+#Create percentage of tip(%) variable
+rawdata<-rawdata%>%filter(Total_amount>=2.5)%>%mutate(Tip_Per=(Tip_amount/Total_amount)*100)
+
+#Distribution of Tip percentage(Tip_Per(%))
+p<-ggplot(rawdata, aes(x=Tip_Per)) + 
+  geom_histogram(color="black", fill="red")+xlab("Tip(%)")+theme_gray()
+p
+
+#Check % of no tip trips
+sum(rawdata$Tip_Per==0)/dim(rawdata)[1]
+
+```
+
+"Tip_Per" showed that 59.48% of all transactions did not give tips.This is a typical zero-inflated dataset.If we only use one model to predict all tip percentages, the large numbers of zero values will influence the model performance and bias the final prediction results.
+
+One way to solve this problem is to build a tree-based regression-type model.This model can be considered as a combination of decision tree and regression type model.The general modeling strategy is as followings:
+
+1. After data cleaning, we create a variable(Tip_give) to represent whether people give tip or not.
+
+2. During data exploration and feature engineering in modeling dataset, we identify a feature as the node of a shallow decision tree. The feature should have the strongest association with 'Tip_give' in step 1 and can also be explained by reasonable business insights (i.e. domain knowledge). 
+
+3. After splitting modeling dataset into train/test datasets,the train dataset are then split into two subgroups according to the tree structure defined in step 2. In general, trips in first subgroup should have almost 0% tips and the majority of trips in the second group should have non-zero tips.
+
+4. For train dataset, the predictive model will only be trained in the second subgroup.For the first subgroup, we predict tip percentage in each trip as 0.
+
+5. We will compare the tree-based regression model with baseline linear regression model in test dataset to demonstrate the advantage of this new integration method. More details of advantages for this tree-based model framework will be introducted in final discussion section of this question.  
+
+#### **Data Cleaning**
+
+**Step 1: Check missing values**
+```{r}
+#Create missing information
+mice_plot <- aggr(rawdata, col=c('navyblue','yellow'),
+                  numbers=TRUE, sortVars=TRUE,
+                  labels=names(rawdata), cex.axis=.7,
+                  gap=1, ylab=c("Missing data","Pattern"))
+
+#remove and impute missing values
+rawdata<-rawdata[,!names(rawdata)%in%c('Ehail_fee')]
+rawdata$Trip_type[is.na(rawdata$Trip_type)]<-1
+
+```
+
+There are only two vairbles that contain missing values. The variable Ehail_fee is 100% missing and we delete it from the dataset. The missing percentage Missing values of Trip_type were replaced with the most common value 1
+
+**Step 2: Data Checking based on data description**
+
+There are four types of variables in this dataset: Categorical, Continuous, Time and location
+
+**A. Categorical variables: VendorID,Store_and_fwd_flag,RateCodeID,Payment_type,Trip_type**
+```{r}
+#Check whether VendorID are coded as 1 and 2
+table(rawdata$VendorID)
+
+#Check whether Store_and_fwd_flag are coded as Y and N
+table(rawdata$Store_and_fwd_flag)
+
+#Check whether Rate_ID are coded as 1-6
+table(rawdata$RateCodeID)
+
+#Rate_ID: there are 4 trips coded as 99(<0.001%), we replace it with most common value 1
+rawdata$RateCodeID[which(rawdata$RateCodeID==99)]<-1
+
+#Check whether Payment_type are coded as 1-6
+table(rawdata$Payment_type)
+
+#Transform to categorical variables
+factors_trans <- function(dta, variables){
+  for (variable in variables){
+    dta[[variable]] <- as.factor(dta[[variable]])
+  }
+  return(dta)
+}
+
+# select variables for data transformation
+categorical_var <- c('VendorID','Store_and_fwd_flag','RateCodeID','Payment_type','Trip_type')
+
+# transform data types
+rawdata <- factors_trans(dta = rawdata, 
+                        variables=categorical_var)
+
+# verify transformation in data frame details
+str(rawdata)
+
+```
+
+**B. Continuous variables:Passenger_count,Trip_distance,Fare_amount,Extra,MTA_tax,Tip_amount,Tolls_amount,improvement_surcharge,Total_amount**
+```{r}
+#Remove observations that have 0 passenger counts
+rawdata<-rawdata%>%filter(Passenger_count>0)
+
+#Remove observations that have trip distance=0 and trip distance>50(outliers and only 67 observations)
+rawdata<-rawdata%>%filter(Trip_distance>0,Trip_distance<=50)
+
+#Check whether amount has negative values or near zero variance
+amount_ind<-c('Fare_amount','Extra','MTA_tax','Tip_amount','Tolls_amount',
+'improvement_surcharge','Total_amount')
+
+for (i in 1:length(amount_ind))
+{
+negative<-sum(as.numeric(rawdata[,amount_ind[[i]]])<0)
+variance<-var(as.numeric(rawdata[,amount_ind[[i]]]))
+print(paste0("The number of negative values of",sep=' ',amount_ind[[i]],'=',negative))
+print(paste0("The variance of",sep=' ',amount_ind[[i]],'=',variance))
+
+}
+
+##Remove negative value of Extra variable (only 1)
+rawdata<-rawdata%>%filter(Extra>=0)
+```
+
+**C. Time variables:lpep_pickup_datetime,Lpep_dropoff_datetime**
+
+It is hard to directly use the pick up/drop off time. Thus we tranform the date into hour, weekday and weekend,week for september,2015.
+```{r}
+#Convert to date type
+rawdata<-rawdata%>%select(-Hour_day)
+rawdata <- rawdata %>% mutate(lpep_pickup_datetime = ymd_hms(lpep_pickup_datetime),
+                pickup_hour=hour(lpep_pickup_datetime),
+                pickup_weekday=as.factor(weekdays(lpep_pickup_datetime)),
+                pickup_weekend=if_else(pickup_weekday=='Saturday'|pickup_weekday=='Sunday','Weekend','Weekday'),
+                Lpep_dropoff_datetime = ymd_hms( Lpep_dropoff_datetime),
+                dropoff_hour=hour(lpep_pickup_datetime),
+                dropoff_weekday=as.factor(weekdays(lpep_pickup_datetime)),
+                dropoff_weekend=if_else(dropoff_weekday=='Saturday'|dropoff_weekday=='Sunday','Weekend','Weekday')
+)
+
+#Transform to y/m/d date format
+Date<-as.Date(rawdata$lpep_pickup_datetime,format="%Y-%m-%d")
+
+#Extract day from date
+Day<-as.numeric(substr(Date,9,10))
+
+#Create week variable (week=1-5) from pick up time
+Week<-array()
+Week[which((Day>=1)&(Day<=6))]<-1
+Week[which((Day>=7)&(Day<=13))]<-2
+Week[which((Day>=14)&(Day<=20))]<-3
+Week[which((Day>=21)&(Day<=27))]<-4
+Week[which((Day>=28)&(Day<=30))]<-5
+
+rawdata$week<-Week
+
+```
+The weekday, weekend and week variables were created with the possible hypothesis that people may be willing to tip depending on the day of week or time of the day.Though we created dropoff variables, we will use pickup time in model building.
+
+**D. Location variables:Pickup_longitude,Pickup_latitude,Dropoff_longitude,Dropoff_latitude**
+
+It is very hard to directly use longitude and latitude. Instead, we used districts where the pick-up activities (longitude and latitude) occured identified by Zillow NYC area shapefiles. The link is as followings:
+<https://www.zillow.com/howto/api/neighborhood-boundaries.htm>
+
+```{r}
+# Load required package for geo-data processing
+Map_NYC <- readOGR("ZillowNeighborhoods-NY.shp", layer="ZillowNeighborhoods-NY")
+Map_Filter = Map_NYC[Map_NYC$City == 'New York', ]
+Location_Data_Pickup <- data.frame(Longitude = rawdata$Pickup_longitude, 
+                                   Latitude = rawdata$Pickup_latitude)
+Location_Data_Dropoff <- data.frame(Longitude = rawdata$Dropoff_longitude, 
+                                    Latitude = rawdata$Dropoff_latitude)
+# Identify the pickup location
+coordinates(Location_Data_Pickup) <- ~ Longitude + Latitude
+proj4string(Location_Data_Pickup) <- proj4string(Map_Filter)
+County_Pickup = as.character(over(Location_Data_Pickup, Map_Filter)$County)
+# Identify the dropoff location
+coordinates(Location_Data_Dropoff) <- ~ Longitude + Latitude
+proj4string(Location_Data_Dropoff) <- proj4string(Map_Filter)
+County_Dropoff = as.character(over(Location_Data_Dropoff, Map_Filter)$County)
+
+#Generate county variable
+rawdata$County_Pickup = County_Pickup
+rawdata$County_Dropoff = County_Dropoff
+
+# Replace missing values with 'Unknown'
+rawdata$County_Pickup[is.na(rawdata$County_Pickup)] = 'Other'
+rawdata$County_Dropoff[is.na(rawdata$County_Dropoff)] = 'Other'
+
+rm(Location_Data_Dropoff,Location_Data_Pickup)
+```
+We will only use pick up county here in next steps.
+
+#### **Data Exploration and Feature engineering**
+
+**Feature Transformation and Feature engineering**
+
+We create Trip duration (Duration) and speed (Speed) variables.
+```{r}
+#Generate modeling dataset
+modeldata<-rawdata
+
+###transform time related varaibles to categorical variables
+modeldata$pickup_weekend<-as.factor(modeldata$pickup_weekend)
+modeldata$dropoff_weekend<-as.factor(modeldata$dropoff_weekend)
+modeldata$week<-as.factor(modeldata$week)
+modeldata$pickup_hour<-as.factor(modeldata$pickup_hour)
+
+###Transform location vairable to categorical variable
+modeldata$County_Pickup<-as.factor(modeldata$County_Pickup)
+
+##transform extra,MTA_tax and improvement_surcharge to categorical variables
+modeldata$Extra<-as.factor(modeldata$Extra)
+modeldata$MTA_tax<-as.factor(modeldata$MTA_tax)
+modeldata$improvement_surcharge<-as.factor(modeldata$improvement_surcharge)
+
+#Create trip duration (min).
+modeldata$Duration<-as.numeric(modeldata$Lpep_dropoff_datetime-modeldata$lpep_pickup_datetime)/60
+
+#Remove trip duration equal to 0, 141 trips are removed
+modeldata<-modeldata%>%filter(Duration>0)
+
+#Create speed (mile per hour)
+modeldata$Speed<-(modeldata$Trip_distance)/(modeldata$Duration/60)
+
+#For speed >200 mile per hour, we replace with the mean speed
+modeldata[modeldata$Speed>200,]$Speed<-mean(modeldata[modeldata$Speed<=200,]$Speed)
+
+#Recheck the data structure
+str(modeldata)
+```
+
+**Create whether people give tips in trips**
+```{r}
+modeldata$Tip_give<-as.factor(ifelse(modeldata$Tip_Per>0,'Yes','No'))
+```
+
+**Data Exploration**
+
+Before data exploration, we create some analysis functions used for data exploration of continuous and categorical variables.
+```{r}
+#Continous summary function
+Continous_stats <- function(x, detailed=FALSE){
+  options(scipen=100)
+  options(digits=2)
+  if (detailed){
+    var.stats <- stat.desc(x)
+  }else{
+    var.stats <- summary(x)
+  }
+  dta <- data.frame(round(as.numeric(var.stats),2))
+  colnames(dta) <- deparse(substitute(con))
+  rownames(dta) <- names(var.stats)
+  dta
+}
+
+#Continous visualization function
+#Density and boxplot###
+Visual_Distribution <- function(var){
+  pl1 <- qplot(var, geom="histogram", 
+               fill=I('Red'), binwidth=5,
+               col=I('Black'))+ theme_bw()
+  pl2 <- qplot(var, geom="density",
+               fill=I('Red'), binwidth=5, 
+               col=I('Black'))+ theme_bw()
+  
+  grid.arrange(pl1,pl2, ncol=2)
+}
+
+# Scatter plots
+Visual_Scatter <- function(x, y){
+  pl3 <- qplot(x, y,geom='point',colour = I("red"),
+               xlab = deparse(substitute(x)),
+               ylab = deparse(substitute(y))) + theme_bw()
+  pl3
+}
+
+# box plots
+Visual_Boxplot <- function(x, y){
+  pl1 <- qplot(factor(0),x, geom="boxplot", 
+               xlab = deparse(substitute(x)), 
+               ylab="values") + theme_bw()
+  pl2 <- qplot(y,x,geom="boxplot",
+               xlab = deparse(substitute(y)),
+               ylab = deparse(substitute(x))) + theme_bw()
+  
+  grid.arrange(pl1,pl2, ncol=2)
+}
+
+##Categorical summary function
+# summary statistics
+Categorical_stats <- function(x){
+  
+  feature.name = deparse(substitute(x))
+  dta1 <- data.frame(table(x))
+  colnames(dta1) <- c(feature.name, "Frequency")
+  dta2 <- data.frame(prop.table(table(x)))
+  colnames(dta2) <- c(feature.name, "Proportion")
+  
+  dta <- merge(
+    dta1, dta2, by = feature.name
+  )
+  dta_final <- dta[order(-dta$Frequency),]
+  dta_final
+}
+
+# Contingency table
+Contingency_table <- function(y, x, test=F){
+  if(test == F){
+    CrossTable(y, x, digits=2, 
+               prop.r=F, prop.t=F, prop.chisq=F)
+  }else{
+    CrossTable(y, x, digits=2, 
+               prop.r=F, prop.t=F, prop.chisq=F,
+               chisq=T, fisher=T)
+  }
+}
+
+# visualizations
+# barcharts
+Visual_Barchart <- function(x){
+  qplot(x, geom="bar", 
+        fill=I('red'), col=I('black'),
+        xlab = deparse(substitute(x))) + theme_bw()
+}
+
+# mosaic plots
+Visual_mosaic<- function(y, x){
+  mosaicplot(y ~ x, color=T,  
+             main = "Contingency table plot")
+}
+```
+
+**Data exploration for continous variables**
+```{r}
+attach(modeldata)
+continuous_var<-c('Passenger_count','Trip_distance','Fare_amount','Tip_amount','Tolls_amount','Total_amount',
+                  'Duration','Speed')
+#Passenger_count
+Visual_Barchart(Passenger_count)
+Categorical_stats(Passenger_count)
+Visual_Boxplot(Passenger_count,Tip_give)
+Visual_Scatter(Passenger_count,Tip_Per)
+
+#Trip_distance
+Continous_stats(Trip_distance)
+Visual_Distribution(Trip_distance)
+Visual_Boxplot(Trip_distance,Tip_give)
+Visual_Scatter(Trip_distance,Tip_Per)
+
+#Fare_amount
+Continous_stats(Fare_amount)
+Visual_Distribution(Fare_amount)
+Visual_Boxplot(Fare_amount,Tip_give)
+Visual_Scatter(Fare_amount,Tip_Per)
+
+#Tip_amount
+Continous_stats(Tip_amount)
+Visual_Distribution(Tip_amount)
+Visual_Boxplot(Tip_amount,Tip_give)
+Visual_Scatter(Tip_amount,Tip_Per)
+
+#Tolls_amount
+Continous_stats(Tolls_amount)
+Visual_Distribution(Tolls_amount)
+Visual_Boxplot(Tolls_amount,Tip_give)
+Visual_Scatter(Tolls_amount,Tip_Per)
+
+#Total_amount
+Continous_stats(Total_amount)
+Visual_Distribution(Total_amount)
+Visual_Boxplot(Total_amount,Tip_give)
+Visual_Scatter(Total_amount,Tip_Per)
+
+#Duration
+Continous_stats(Duration)
+Visual_Distribution(Duration)
+Visual_Boxplot(Duration,Tip_give)
+Visual_Scatter(Duration,Tip_Per)
+
+#Speed
+Continous_stats(Speed)
+Visual_Distribution(Speed)
+Visual_Boxplot(Speed,Tip_give)
+Visual_Scatter(Speed,Tip_Per)
+
+#Correlation test for continuous variable and Tip_Per variable
+
+for (i in 1:length(continuous_var))
+{
+
+  cor<-round(as.numeric(cor.test(modeldata[,continuous_var[[i]]],modeldata$Tip_Per)$estimate),3)
+  p<-round(as.numeric(cor.test(modeldata[,continuous_var[[i]]],modeldata$Tip_Per)$p.value),3)
+  print(paste0("The correlation between",sep=' ',continuous_var[[i]],sep=' ','and Tip_per =',cor,sep=' ','with p value',sep=' ',p))
+}
+
+
+##Generate heatmap for continuous variables
+dta_feature<-modeldata[,names(modeldata)%in%continuous_var]
+bc <- cor(dta_feature) 
+corrplot(bc, order ="hclust")
+
+```
+
+By exploring continuous variables, four main points were discovered: 
+
+1. For Passenger_count, the correlation test shows very small correlation with large p value. Thus we don't consider it in next steps. Tip amount has strong correlation with Tip_per. The more tip amount is, the higher tip percentage is. This is kind of future leaking information. Thus we also don't include Tip_amount into our modeling stage.
+
+2. Except Passenger_count and Tip_amount, Other variables all show non-linear relationship with Tip_per. That is the reason why linear correlation is small for the majority of continuous variables. For Fare_amount, Tolls_amount,Speed, duration,the tip percentage (Tip_Per) decreases as these variables increase and converges around 25% from scatter plots. It may imply that people don't want to tip more money with the increase of length of trip and trip duration. However, the tip percentage (Tip_Per) increases as Total_amount increases. From heatmap, Trip_distance, Fare_amount and Total_amount are highly correlated. That is the reason why Fare_amount, Tolls_amount and Total_amount have similiar scatterplots and data patterns.
+
+3. For Speed, one interesting discovery is that higher speed leads to lower tips. The possible reason is that  people don't feel safe in high speed trips and don't appreciate the trip service.
+
+4.Based on boxplot, the value of these variables are not significantly different in Tip given and Tip not given group. 
+
+**Data exploration for categorical variables**
+```{r}
+detach(modeldata)
+categorical_var<-c('VendorID','Store_and_fwd_flag','RateCodeID','Extra','MTA_tax','improvement_surcharge',
+                  'Payment_type','Trip_type','pickup_hour','pickup_weekday','pickup_weekend','week',
+                  'County_Pickup')
+attach(modeldata)
+
+#VenderID
+Categorical_stats (VendorID)
+Contingency_table(Tip_give,VendorID,test=F)
+Visual_mosaic(Tip_give,VendorID)
+Visual_Boxplot(Tip_Per,VendorID)
+
+#Store_and_fwd_flag
+Categorical_stats (Store_and_fwd_flag)
+Contingency_table(Tip_give,Store_and_fwd_flag,test=F)
+Visual_mosaic(Tip_give,Store_and_fwd_flag)
+Visual_Boxplot(Tip_Per,Store_and_fwd_flag)
+
+#RateCodeID
+Categorical_stats (RateCodeID)
+Contingency_table(Tip_give,RateCodeID,test=F)
+Visual_mosaic(Tip_give,RateCodeID)
+Visual_Boxplot(Tip_Per,RateCodeID)
+
+#Extra
+Categorical_stats (Extra)
+Contingency_table(Tip_give,Extra,test=F)
+Visual_mosaic(Tip_give,Extra)
+Visual_Boxplot(Tip_Per,Extra)
+
+#MTA_tax#
+Categorical_stats (MTA_tax)
+Contingency_table(Tip_give,MTA_tax,test=T)
+Visual_mosaic(Tip_give,MTA_tax)
+Visual_Boxplot(Tip_Per,MTA_tax)
+
+#improvement_surcharge#
+Categorical_stats (improvement_surcharge)
+Contingency_table(Tip_give,improvement_surcharge,test=T)
+Visual_mosaic(Tip_give,improvement_surcharge)
+Visual_Boxplot(Tip_Per,improvement_surcharge)
+
+#Trip_type#
+Categorical_stats (Trip_type)
+Contingency_table(Tip_give,Trip_type,test=F)
+Visual_mosaic(Tip_give,Trip_type)
+Visual_Boxplot(Tip_Per,Trip_type)
+
+#pickup_hour#
+Categorical_stats (pickup_hour)
+Contingency_table(Tip_give,pickup_hour,test=F)
+Visual_mosaic(Tip_give,pickup_hour)
+Visual_Boxplot(Tip_Per,pickup_hour)
+
+#pickup_weekday#
+Categorical_stats (pickup_weekday)
+Contingency_table(Tip_give,pickup_weekday,test=F)
+Visual_mosaic(Tip_give,pickup_weekday)
+Visual_Boxplot(Tip_Per,pickup_weekday)
+
+#pickup_weekend#
+Categorical_stats (pickup_weekend)
+Contingency_table(Tip_give,pickup_weekend,test=F)
+Visual_mosaic(Tip_give,pickup_weekend)
+Visual_Boxplot(Tip_Per,pickup_weekend)
+
+#week#
+Categorical_stats (week)
+Contingency_table(Tip_give,week,test=F)
+Visual_mosaic(Tip_give,week)
+Visual_Boxplot(Tip_Per,week)
+
+#County_Pickup#
+Categorical_stats (modeldata$County_Pickup)
+Contingency_table(Tip_give,modeldata$County_Pickup,test=F)
+Visual_mosaic(Tip_give,modeldata$County_Pickup)
+Visual_Boxplot(Tip_Per,modeldata$County_Pickup)
+
+#Payment_type#
+Categorical_stats (Payment_type)
+Contingency_table(Tip_give,Payment_type,test=F)
+Visual_mosaic(Tip_give,Payment_type)
+Visual_Boxplot(Tip_Per,Payment_type)
+
+for (i in 1:length(categorical_var))
+{
+model <- lm(Tip_Per~modeldata[,categorical_var[[i]]],data= modeldata)
+p1<-summary(model)$coefficients[2,4]
+print(paste0("The p value of regression with",sep=' ',categorical_var[[i]],sep=' ','and Tip_Per   =',sep=' ',p1))
+}
+
+```
+
+Seen from mosaic plot, Payment_type is the significant factor that associate with Tip_give. Among the trips with credit card,86% had paid tips. For trips not paid by credit card, 0% had paid tips. Among trips with tips, ~100% are paid with creadit card(Payment_type=1).One of the possible reason for this phenomenon is that taxi drivers were more likely to report less tips then what they received when they were paid in cash. Cash pay is a way to evade tax and taxi companies will earn some of the tips if the trip was paid with credit card. Thus Payment_type is a good feature as the node of our decision tree. We create a new binary categorical 'payment_card' to represent whether the trip is paid with credit card or not.
+
+```{r}
+#create payment_card variable
+modeldata$payment_card<-as.factor(ifelse(modeldata$Payment_type==1,'Yes','No'))
+```
+
+#### **Model Building**
+Based on data exploration, the variables with p value<0.05 in univariate analysis are chosen as candidate features in modeling stage.The target variable is Tip_Per.
+
+**Candidate feature variable set**
+```{r}
+final_set<-c('Trip_distance','Fare_amount','Tolls_amount','Total_amount',
+                  'Duration','Speed','VendorID','Store_and_fwd_flag','RateCodeID','Extra','MTA_tax',
+             'improvement_surcharge','payment_card','Trip_type','pickup_hour','pickup_weekday','pickup_weekend','week','County_Pickup')
+
+final_modeldata<-modeldata[,c(final_set,'Tip_Per')]
+rm(modeldata,rawdata)
+
+backupdata<-final_modeldata
+
+```
+
+**Normalize continuous variables**
+```{r}
+## normalizing - scaling
+scale.features <- function(dta, variables){
+  for (variable in variables){
+    dta[[variable]] <- scale(dta[[variable]], center=T, scale=T)
+  }
+  return(dta)
+}
+
+continuous_var<-c('Trip_distance','Fare_amount','Tolls_amount','Total_amount','Duration','Speed')
+final_modeldata <- scale.features(final_modeldata, continuous_var)
+```
+
+**Generate training/testing dataset and check their data pattern**
+```{r}
+# split data into training and test datasets in 80:20 ratio
+set.seed(1234)
+indexes <- sample(1:nrow(final_modeldata), size=0.8*nrow(final_modeldata))
+train_data <- final_modeldata[indexes,]
+test_data <- final_modeldata[-indexes,]
+
+#Check data pattern using PCA analysis
+train_feature<-train_data[,c('Trip_distance','Fare_amount','Tolls_amount','Total_amount',
+                  'Duration','Speed','Tip_Per')]
+test_feature<-test_data[,c('Trip_distance','Fare_amount','Tolls_amount','Total_amount',
+                  'Duration','Speed','Tip_Per')]
+pca <- prcomp(train_feature,
+              scale. = TRUE)
+a1<-autoplot(pca,data = train_feature)+ggtitle("Training dataset") 
+pca1 <- prcomp(test_feature,scale. = TRUE)
+a2<-autoplot(pca1,data = test_feature)+ggtitle("Testing dataset") 
+
+grid.arrange(a1,a2, ncol=2)
+rm(train_feature,test_feature)
+```
+
+Seen from the biplot of PCA, the train and test datasets have similiar pattern.There are 1174761 trips and 293691 trips in train and test datasets respectively. For model comparison, we will use MSE (Mean Square Error) and  correlation between observed and predicted values as the two main metrics to measure model performance. In the test data, the mean square error (MSE) is also compared with the variance of Tip_Per in the test dataset. If MSE is smaller than the variance of Per_tip in test dataset, the predictive model is considered as a good model.
+
+**Generate baseline model: stepwise regression using entire dataset**
+We firstly generate a linear regression using entire train datasets. Stepwise algorithom is applied here for feature selection.
+```{r }
+#Full<-lm(Tip_Per~.,data=train_data)
+#Null<-lm(Tip_Per~1,data=train_data)
+#step(Null, scope = list(upper=Full), data=train, direction="both")
+
+#Note:we run the codes above to get final model, to save running time, I only show the final model
+
+#Final model
+base<-lm(formula = Tip_Per ~ payment_card + County_Pickup + Total_amount + 
+    Fare_amount + Tolls_amount + Extra + RateCodeID + pickup_hour + 
+    Duration + Trip_distance + Speed + MTA_tax + VendorID + week + 
+    pickup_weekday + improvement_surcharge + Trip_type, data = train_data)
+summary(base)
+
+predict_base <- predict(base, newdata = test_data)
+
+#MSE
+MSE_base<-sum((test_data$Tip_Per-predict_base)^2)/dim(test_data)[1]
+
+#Correlation
+cor_base<-as.numeric(cor.test(predict_base,test_data$Tip_Per)$estimate)
+
+#variance of Tip_Per in test dataset
+var_test<-var(test_data$Tip_Per)
+```
+
+**Generate tree-based regression model**
+As we discussed, we firstly split train dataset into two subgroups using variable payment_card. For payment_card=='No' group, we predict all trips without tips. The linear-type model is only considered in payment_card=='Yes' group. Here two different regression models are considered: stepwise linear regression and penalized regression.  
+
+Note: random froest, Gradient Boosting and ensemble method: random froest regression+Gradient Boosting, the mean of the predicted values that we obtain using the Random Forestand the Gradient
+Boosting are also considered here. But their performacnes are very similar to stepwise and penalized regression here. To avoid the long waiting time for generating the final notebook, I skip showing their results here. These two commonly used methods can be trained by train() function in R with 'rf' and 'XgbTree'. The main purpose of modeling part is still to demonstrate the advantage of tree-based regression model for predicting continuous variable. 
+
+```{r}
+#Split the train/test dataset using payment_card
+sub_train1<-train_data[train_data$payment_card=='No',]
+sub_train2<-train_data[train_data$payment_card=='Yes',]
+sub_train2<-sub_train2%>%select(-payment_card)
+
+sub_test1<-test_data[test_data$payment_card=='No',]
+sub_test2<-test_data[test_data$payment_card=='Yes',]
+sub_test2<-sub_test2%>%select(-payment_card)
+
+#Check Tip_Per in sub_train1
+mean(sub_train1$Tip_Per)
+```
+
+The mean of Tip_per in payment_card=='No' group is 5.37e-05. we predict trips in this group 0. We train our model in 
+payment_card=='Yes' group (sub_train2).
+
+**stepwise regression**
+```{r }
+#Full<-lm(Tip_Per~.,data=sub_train2)
+#Null<-lm(Tip_Per~1,data=sub_train2)
+#reg1<-step(Null, scope = list(upper=Full), data=sub_train2, direction="both")
+
+#Note:we run the codes above to get final model, to save running time, I only show the final model
+
+reg1<-lm(formula = Tip_Per ~ County_Pickup + Fare_amount + Total_amount + 
+    Tolls_amount + Extra + Duration + RateCodeID + pickup_hour + 
+    VendorID + Trip_distance + Speed + week + pickup_weekday + 
+    improvement_surcharge, data = sub_train2)
+summary(reg1)
+
+predict_step <- predict(reg1, newdata = sub_test2)
+importance <- varImp(reg1,scale = FALSE)
+importance
+
+
+#MSE
+MSE_step<-(sum((sub_test2$Tip_Per-predict_step)^2)+sum((sub_test1$Tip_Per)^2))/dim(test_data)[1]
+
+#Correlation
+pre<-c(rep(0,dim(sub_test1)[1]),predict_step)
+dta<-rbind(sub_test1[,!names(sub_test1)%in%c('payment_card')],sub_test2)
+cor_step<-as.numeric(cor.test(pre,dta$Tip_Per)$estimate)
+rm(pre,dta)
+
+```
+
+**Penalized regression**
+```{r}
+set.seed(1234)
+formula.init <- "Tip_Per~."
+formula.init <- as.formula(formula.init)
+
+#5-cross validation,repeat 2 times
+control <- trainControl(method="repeatedcv", number=5, repeats=2)
+model <- train(formula.init, data=sub_train2, method="glmnet",trControl=control)
+
+#Get optimal parameter: alpha=0.55,s=0.0016
+train_mat<-model.matrix(Tip_Per~.,sub_train2)[,1:18]
+test_mat<-model.matrix(Tip_Per~.,sub_test2)[,1:18]
+temp<-glmnet(train_mat, sub_train2[,19],alpha=0.55)
+predict_penal<-predict(temp,newx=test_mat,type='response', s=0.0016) 
+
+importance <- varImp(model,scale=FALSE)
+importance
+
+#MSE
+MSE_penal<-(sum((sub_test2$Tip_Per-predict_penal)^2)+sum((sub_test1$Tip_Per)^2))/dim(test_data)[1]
+
+#Correlation
+pre<-c(rep(0,dim(sub_test1)[1]),predict_penal)
+dta<-rbind(sub_test1[,!names(sub_test1)%in%c('payment_card')],sub_test2)
+cor_penal<-as.numeric(cor.test(pre,dta$Tip_Per)$estimate)
+rm(pre,dta)
+
+```
+
+From both stepwise regression or penalized regression, the top 3 main factors that contribute to prediction are Total_amount,Fare_amount,Tolls_amount and County(i.e. whether your piackup location is in King or not). The model results indicated that more fare amount and tolls amount would lead to lower percentage of tips.In addition, the pickup location in King County would have a higher tip percentage in general. 
+
+For model comparison, the variance of Tip_Per in test dataset is 76.43. MSE of baseline regression using entire train dataset (MSE_base) is 15.54, the corrleation between observed and predicted percentage of tips(%) (cor_base) is 0.893. The MSE of tree-based stepwise regression model (MSE_step) is 12.13 and correlation is 0.917.The MSE of tree-based stepwise regression model (MSE_step) is 12.32 and correlation is 0.916. The tree-based stepwise regression has the lowest MSE and highest correlation. Among these three models, it is the optimal one though it perform a little worse than ensemble methods (Not shown here due to computing time).
+
+**Discussion**
+Compared to traditional group model, this integrative tree-based approach usually performs better in robustness and stability for deployment. In this case study, whether to use credit card is our tree node and we adpoted different model stretegy for these two subgroups. This tree-based model had much better performance than the traditional group model using all train dataset. 
+
+In addition, this tree-base framework can be easily explained to audience without much data science knowledge.It can be applied for risk stratification and continous prediction in fields that need strong domain knowledge like healthcare, finance, oil&energy and so on. 
+
+The general strategy is to build a shallow decision tree before modeling. For my experience, one to three layers would be appropriate based on sample size. Then under each node, we can build seperate models or criteria. The last step is to combind all the results from different subgroups splitted by tree nodes.
+
+>Question 5(Option A):
+
+* Build a derived variable representing the average speed over the course of a trip.
+* Can you perform a test to determine if the average trip speeds are materially the same in all weeks of September? If you decide they are not the same, can you form a hypothesis regarding why they differ?
+* Can you build up a hypothesis of average trip speed as a function of time of day?
+
+#### **Speed and weeks of September**
+
+We already create speed and week of month variable in Question 4. Here we firstly do an ANOVA analysis to test null hypothesis: Average trip speeds are materially the same in all weeks of September.ANOVA analysis was conducted between average speed and the week of September (i.e.1~5). 
+
+```{r}
+##Anova test###
+out<-lm(Speed~week,backupdata)
+anova(out)
+
+##Boxplot for week
+p <- ggplot(backupdata, aes(x=week, y=Speed)) + theme_bw()+geom_boxplot()
+p
+
+#Tukey test
+tukey.test <- TukeyHSD(aov(out))
+tukey.test 
+
+#Visualize the 95% CI
+plot(tukey.test )
+```
+
+The ANOVA test indicates a large f-value and a small p-value, therefore we reject the null hypothesis and conclude that the week of the month does seem to be related to the average speed. Then we further do a Tukey’s test for multiple group comparisons.Tukey’s test compares the means of all groups to the mean of every other treatment. From Tukey test results, we observed that average speeds have no significant difference in Week 2 and Week 3 with adjusted p value=0.973.The rest of the weeks have very small adjusted p-values, so we reject the null hypothesis and they are significantly different.
+
+#### **Speed and time of day**
+
+Similarly, we firstly check whether speed and time of day has significant association using ANOVA test. The result below shows they are significant associated. 
+
+```{r}
+##Anova test###
+out<-lm(Speed~pickup_hour,backupdata)
+anova(out)
+
+#Histogram#
+ggplotly(backupdata %>% group_by(pickup_hour) %>% summarise(ave_speed=mean(Speed)) %>% 
+  ggplot(aes(pickup_hour, ave_speed, fill = ave_speed)) + geom_col() +
+  geom_label(aes(label=round(ave_speed,2)), size=3.5, alpha=.7) +
+  # coord_flip() +
+  #scale_x_continuous(breaks=seq(1,24,1)) +
+  theme_bw() +
+  theme(legend.position = 'none') +
+  labs(title='Average Speed During time of day',y="Average Speed", x="Time of Day (Pickup)"))
+
+```
+
+See the figure above, there is a very clear increase in average speed until approximately 5:00 AM to 6:00 AM. The minimum average speed appeared round evening that is the busiest work-to-home peak time. The average speed varies significantly over different hour of the day.The average speed is dependent on the hour of day. During the morning before work time, the traffic is not busy and the speed is higher while the speed will decrease significantly during the busy day time. And the speed would increase again at night. 
+
+
+
+
